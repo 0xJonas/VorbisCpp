@@ -2,82 +2,376 @@
 #include "util.h"
 
 #include <string>
+#include <algorithm>
 #include <istream>
+#include <cmath>
+#include <cstdint>
 
 using namespace vcpp;
 
-void OggPacket::addNewPageCallback(NewPageCallback& callback) {
-    callbacks.push_back(&callback);
-}
+const CRC32 oggCRC(0x04C11DB7);
 
-void OggPhysicalStream::addNewStreamCallback(NewStreamCallback& callback) {
-    newStreamCallbacks.push_back(&callback);
-}
+const unsigned int maxPageSize = 255 * 255;
 
-void OggPhysicalStream::addNewPacketCallback(uint32_t streamSerialNumber, NewPacketCallback& callback) {
-    if (newPacketCallbacks.find(streamSerialNumber) == newPacketCallbacks.end()) {
-        newPacketCallbacks.insert({ streamSerialNumber, std::vector<NewPacketCallback*>() });
-    }
-
-    std::vector<NewPacketCallback*>& callbacks = newPacketCallbacks.at(streamSerialNumber);
-    callbacks.push_back(&callback);
-}
+static const uint8_t capturePattern[4] { 0x4f, 0x67, 0x67, 0x53 };   // "OggS"
 
 static inline void oggAssert(
-    bool condition, 
+    bool condition,
     const std::string& message,
     OggStreamError::Cause cause = vcpp::OggStreamError::Cause::Other
 ) {
     if (!condition) {
-        throw OggStreamError(cause, message);
+        throw OggStreamError{ cause, message };
     }
 }
 
-OggPage OggPhysicalStream::readPage() {
+//----------------------------------------------
+//                   OggPage
+//----------------------------------------------
+
+OggPage::OggPage(OggPage::Params&& params)
+    : isContinuedPacket{ std::move(params.isContinuedPacket) },
+      isFirstPage{ std::move(params.isFirstPage) },
+      isLastPage{ std::move(params.isLastPage) },
+      granulePosition{ std::move(params.granulePosition) },
+      streamSerialNumber{ std::move(params.streamSerialNumber) },
+      pageSequenceNumber{ std::move(params.pageSequenceNumber) },
+      pageChecksum{ std::move(params.pageChecksum) },
+      dataSize{ std::move(params.dataSize) },
+      data{ std::move(params.data) } {
+    params.data = nullptr;
+}
+
+//----------------------------------------------
+//             OggLogicalStreamIn
+//----------------------------------------------
+
+OggLogicalStreamIn::OggLogicalStreamIn(uint32_t streamSerialNumber)
+    : streamSerialNumber_{ streamSerialNumber },
+      granulePosition_{ -1 }, 
+      pageSequenceNumber_{ 0 },
+      isOpen_{ false } {}
+
+void OggLogicalStreamIn::addDataCallback(DataCallback& callback) {
+    dataCallbacks_.push_back(&callback);
+}
+
+void OggLogicalStreamIn::removeDataCallback(const DataCallback& callback) {
+    auto callbackIt{ find(dataCallbacks_.cbegin(), dataCallbacks_.cend(), &callback) };
+    dataCallbacks_.erase(callbackIt);
+}
+
+void OggLogicalStreamIn::processPage(const OggPage& page) {
+    unsigned int numSkippedPages{ 0 };
+
+    if (!page.isFirstPage) {
+        oggAssert(
+            page.pageSequenceNumber > pageSequenceNumber_,
+            "Page sequence number is lower than expected.",
+            OggStreamError::Cause::LatePage
+        );
+        numSkippedPages = page.pageSequenceNumber - (pageSequenceNumber_ + 1);
+    }
+
+    const MetaData meta {
+        page.granulePosition,
+        numSkippedPages,
+        page.isContinuedPacket,
+        page.isLastPage
+    };
+    for (auto it{ dataCallbacks_.begin() }; it != dataCallbacks_.end(); it++) {
+        (*it)->onDataAvailable(page.data, page.dataSize, meta);
+    }
+
+    pageSequenceNumber_ = page.pageSequenceNumber;
+}
+
+//----------------------------------------------
+//            OggPhysicalStreamIn
+//----------------------------------------------
+
+OggPhysicalStreamIn::FileInput::FileInput(FILE* file) : file_{ file } {}
+
+uint8_t OggPhysicalStreamIn::FileInput::read() {
+    uint8_t out{ uint8_t(fgetc(file_)) };
+    if (ferror(file_)) {
+        throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
+    }
+    return out;
+}
+
+std::size_t OggPhysicalStreamIn::FileInput::read(uint8_t* const buffer, const std::size_t count) {
+    std::size_t numChars{ fread(buffer, sizeof(uint8_t), count, file_) };
+    if (ferror(file_)) {
+        throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
+    }
+    return numChars;
+}
+
+bool OggPhysicalStreamIn::FileInput::eof() const {
+    return feof(file_);
+}
+
+OggPhysicalStreamIn::StreamInput::StreamInput(std::basic_istream<uint8_t>& in) : in_{ in } {}
+
+uint8_t OggPhysicalStreamIn::StreamInput::read() {
+    uint8_t out{ uint8_t(in_.get()) };
+    if (in_.fail()) {
+        throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
+    }
+    return out;
+}
+
+std::size_t OggPhysicalStreamIn::StreamInput::read(uint8_t* const buffer, const std::size_t count) {
+    in_.read(buffer, count);
+    if (in_.fail()) {
+        throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
+    }
+    return in_.gcount();
+}
+
+bool OggPhysicalStreamIn::StreamInput::eof() const {
+    return in_.eof();
+}
+
+OggPhysicalStreamIn::OggPhysicalStreamIn(std::basic_istream<uint8_t>& in) : input_{ std::make_unique<StreamInput>(in) } {}
+
+OggPhysicalStreamIn::OggPhysicalStreamIn(FILE* file) : input_{ std::make_unique<FileInput>(file) } {}
+
+void OggPhysicalStreamIn::addNewStreamCallback(NewStreamCallback& callback) {
+    newStreamCallbacks_.push_back(&callback);
+}
+
+void OggPhysicalStreamIn::removeNewStreamCallback(const NewStreamCallback& callback) {
+    auto callbackIt{ find(newStreamCallbacks_.cbegin(), newStreamCallbacks_.cend(), &callback) };
+    newStreamCallbacks_.erase(callbackIt);
+}
+
+OggPage OggPhysicalStreamIn::readPage() {
     uint8_t headerData[23];
-    in.read(headerData, 23);
-    oggAssert(in.gcount() == 23, "Unexpected End Of File", OggStreamError::Cause::UnexpectedEOF);
+    oggAssert(input_->read(headerData, 23) == 23, "Unexpected End Of File", OggStreamError::Cause::UnexpectedEOF);
 
-    const uint8_t streamStructureVersion = headerData[0];
-    oggAssert(streamStructureVersion == 0, "stream_structure_version should be 0.");
+    OggPage::Params params{};
+    params.streamStructureVersion = headerData[0];
+    const uint8_t headerTypeFlag{ headerData[1] };
+    params.isContinuedPacket = (headerTypeFlag & 0x01) != 0;
+    params.isFirstPage = (headerTypeFlag & 0x02) != 0;
+    params.isLastPage = (headerTypeFlag & 0x04) != 0;
+    params.granulePosition = readUInt64LE(&headerData[2]);
+    params.streamSerialNumber = readUInt32LE(&headerData[10]);
+    params.pageSequenceNumber = readUInt32LE(&headerData[14]);
+    params.pageChecksum = readUInt32LE(&headerData[18]);
 
-    const uint8_t headerTypeFlag = headerData[1];
-    const bool continuedPacket = (headerTypeFlag & 0x01) != 0;
-    const bool firstPage = (headerTypeFlag & 0x02) != 0;
-    const bool lastPage = (headerTypeFlag & 0x04) != 0;
+    oggAssert(params.streamStructureVersion == 0, "stream_structure_version should be 0.");
 
-    const int64_t granulePosition = readUInt64LE(&headerData[2]);
-    const uint32_t streamSerialNumber = readUInt32LE(&headerData[10]);
-    const uint32_t pageSequenceNumber = readUInt32LE(&headerData[14]);
-    const uint32_t pageChecksum = readUInt32LE(&headerData[18]);
+    uint32_t checksum{ oggCRC(capturePattern, 4) };
+    headerData[18] = 0;
+    headerData[19] = 0;
+    headerData[20] = 0;
+    headerData[21] = 0;
+    checksum = oggCRC(headerData, 23, checksum);
+
     const uint8_t pageSegments = headerData[22];
 
-    return OggPage(0);
+    uint8_t segmentTable[256];
+    oggAssert(
+        input_->read(segmentTable, pageSegments) == pageSegments,
+        "Unexpected End Of File", 
+        OggStreamError::Cause::UnexpectedEOF
+    );
+    checksum = oggCRC(segmentTable, pageSegments, checksum);
+
+    std::size_t dataSize{ 0 };
+    for (std::size_t i{ 0 }; i < pageSegments; i++) {
+        dataSize += segmentTable[i];
+    }
+    params.dataSize = dataSize;
+    params.data = std::unique_ptr<uint8_t[]>{ new uint8_t[dataSize] };
+
+#define BLOCK_SIZE 0x2000
+    const auto eof = std::basic_istream<uint8_t>::traits_type::eof();
+    const std::size_t strip{ dataSize % BLOCK_SIZE };
+    for (std::size_t i{ 0 }; i < dataSize - strip; i += BLOCK_SIZE) {
+        oggAssert(
+            input_->read(&params.data[i], BLOCK_SIZE) == BLOCK_SIZE,
+            "Unexpected End Of File",
+            OggStreamError::Cause::UnexpectedEOF
+        );
+        checksum = oggCRC(&params.data[i], BLOCK_SIZE, checksum);
+    }
+    oggAssert(
+        input_->read(&params.data[dataSize - strip], strip) == int(strip),
+        "Unexpected End Of File",
+        OggStreamError::Cause::UnexpectedEOF
+    );
+
+    checksum = oggCRC(&params.data[dataSize - strip], BLOCK_SIZE, checksum);
+#undef BLOCK_SIZE
+
+    oggAssert(checksum == params.pageChecksum, "Bad checksum.", OggStreamError::Cause::BadChecksum);
+
+    return OggPage(std::move(params));
 }
 
-template<typename CharT, typename Traits>
-bool findSequence(std::basic_istream<CharT, Traits>& in, const CharT* sequence, const std::size_t size) {
-    std::size_t matches = 0;
-    while (matches < size) {
-        const auto c = in.get();
-        if (in.eof()) {
-            return false;
-        }
-
-        if (Traits::to_char_type(c) == sequence[matches]) {
+void OggPhysicalStreamIn::resync() {
+    std::size_t matches{ 0 };
+    std::size_t capturePatternLength = sizeof(capturePattern) / sizeof(uint8_t);
+    while (matches < capturePatternLength && !input_->eof()) {
+        const uint8_t c{ input_->read() };
+        if (capturePattern[matches] == c) {
             matches++;
         }
-    }
-    return true;
-}
-
-void OggPhysicalStream::process() {
-    const uint8_t pageHeader[4] = { 0x4f, 0x67, 0x67, 0x53 };   // "OggS"
-
-    while (!in.eof()) {
-        bool found = findSequence(in, pageHeader, 4);
-        if (!found) {
-            break;
+        else if (capturePattern[0] == c) {
+            matches = 1;
+        }
+        else {
+            matches = 0;
         }
     }
+}
+
+void OggPhysicalStreamIn::process() {
+    resync();
+    while (!input_->eof()) {
+        const OggPage page{ readPage() };
+
+        auto logicalStreamIt{ logicalStreams_.find(page.streamSerialNumber) };
+        if (logicalStreamIt != logicalStreams_.end()) {
+            logicalStreamIt->second.processPage(page);
+        }
+
+        resync();
+    }
+}
+
+//----------------------------------------------
+//            OggLogicalStreamOut
+//----------------------------------------------
+
+OggLogicalStreamOut::OggLogicalStreamOut(OggPhysicalStreamOut& sink, const uint32_t streamSerialNumber) :
+    sink_{ sink },
+    streamSerialNumber_{ streamSerialNumber },
+    pageSequenceNumber_{ 0 },
+    isPacketOpen_{ false },
+    isStreamOpen_{ true },
+    isFirstWrite_{ true } {}
+
+void OggLogicalStreamOut::writePage(
+        const uint8_t* const data,
+        const unsigned int size,
+        const int64_t granulePosition,
+        const bool closePacket,
+        const bool closeStream) {
+    if (!isStreamOpen_) {
+        throw OggStreamError(OggStreamError::Cause::StreamClosed, "Attempting to write to a closed stream.");
+    }
+    if (size > maxPageSize) {
+        throw OggStreamError(OggStreamError::Cause::Other, "Too much data for a single page.");
+    }
+
+    uint32_t checksum{ oggCRC(capturePattern, 4) };
+
+    uint8_t headerData[23];
+    headerData[0] = 0; // stream_structure_version
+    uint8_t headerTypeFlag{ uint8_t((isPacketOpen_ ? 0x1 : 0) + (isFirstWrite_ ? 0x2 : 0) + (closeStream ? 0x4 : 0)) };
+    headerData[1] = headerTypeFlag;
+    writeUInt64LE(&headerData[2], granulePosition);
+    writeUInt32LE(&headerData[10], streamSerialNumber_);
+    writeUInt32LE(&headerData[14], pageSequenceNumber_);
+    writeUInt32LE(&headerData[18], 0); // checksum
+    const uint8_t pageSegments{ uint8_t((size + 254) / 255) };
+    headerData[22] = pageSegments;
+    checksum = oggCRC(headerData, 23, checksum);
+
+    uint8_t segmentTable[256];
+    for (std::size_t i = 0; i < pageSegments - 1; i++) {
+        segmentTable[i] = 255;
+    }
+    const uint8_t lastSegment{ size % 255 };
+    if (lastSegment == 0) {
+        segmentTable[pageSegments - 1] = 255;
+    }
+    else {
+        segmentTable[pageSegments - 1] = lastSegment;
+    }
+    checksum = oggCRC(segmentTable, pageSegments, checksum);
+
+    checksum = oggCRC(data, size, checksum);
+
+    writeUInt32LE(&headerData[18], checksum);
+
+    sink_.writeLock.lock();
+    sink_.output_->write(capturePattern, 4);
+    sink_.output_->write(headerData, 23);
+    sink_.output_->write(segmentTable, pageSegments);
+    sink_.output_->write(data, size);
+    sink_.writeLock.unlock();
+
+    pageSequenceNumber_++;
+    isFirstWrite_ = false;
+    isPacketOpen_ = !closePacket;
+}
+
+void OggLogicalStreamOut::write(
+        const uint8_t* const data,
+        const unsigned int size,
+        const int64_t granulePosition,
+        const bool closePacket,
+        const bool closeStream) {
+    const std::ldiv_t sizeDiv{ ldiv(size, maxPageSize) };
+
+    std::size_t bytesWritten{ 0 };
+    for (std::size_t i = 0; i < sizeDiv.quot; i++) {
+        writePage(&data[bytesWritten], maxPageSize, granulePosition, false, false);
+        bytesWritten += maxPageSize;
+    }
+    writePage(&data[bytesWritten], sizeDiv.rem, granulePosition, closePacket, closeStream);
+}
+
+//----------------------------------------------
+//            OggPhysicalStreamOut
+//----------------------------------------------
+
+OggPhysicalStreamOut::FileOutput::FileOutput(FILE* file) : file_{ file } {}
+
+void OggPhysicalStreamOut::FileOutput::write(const uint8_t val) {
+    fputc(val, file_);
+}
+
+void OggPhysicalStreamOut::FileOutput::write(const uint8_t* buffer, const std::size_t count) {
+    fwrite(buffer, sizeof(uint8_t), count, file_);
+}
+
+OggPhysicalStreamOut::StreamOutput::StreamOutput(std::basic_ostream<uint8_t>& out) : out_{ out } {}
+
+void OggPhysicalStreamOut::StreamOutput::write(const uint8_t val) {
+    out_.put(val);
+}
+
+void OggPhysicalStreamOut::StreamOutput::write(const uint8_t* buffer, const std::size_t count) {
+    out_.write(buffer, count);
+}
+
+static uint32_t lfsrNext(const uint32_t lfsr) {
+    unsigned int bit{ (lfsr ^ (lfsr >> 1) ^ (lfsr >> 21) ^ (lfsr >> 31)) & 1 };
+    return (lfsr << 1) + bit;
+}
+
+OggLogicalStreamOut OggPhysicalStreamOut::newLogicalStream() {
+    auto maxStreamSerialNum{ std::max_element(assignedSerialNums_.cbegin(), assignedSerialNums_.cend()) };
+    uint32_t streamSerialNumber{ maxStreamSerialNum == assignedSerialNums_.cend() ? 1 : lfsrNext(*maxStreamSerialNum) };
+
+    while (assignedSerialNums_.find(streamSerialNumber) != assignedSerialNums_.cend()) {
+        streamSerialNumber = lfsrNext(streamSerialNumber);
+    }
+
+    return newLogicalStream(streamSerialNumber).value();
+}
+
+std::optional<OggLogicalStreamOut> OggPhysicalStreamOut:: newLogicalStream(const uint32_t streamSerialNumber) {
+    if (assignedSerialNums_.find(streamSerialNumber) != assignedSerialNums_.cend()) {
+        return std::optional<OggLogicalStreamOut>{};
+    }
+    assignedSerialNums_.insert(streamSerialNumber);
+    return std::optional<OggLogicalStreamOut>{ OggLogicalStreamOut{ *this, streamSerialNumber } };
 }
