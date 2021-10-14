@@ -6,7 +6,9 @@ include(GoogleTest)
 
 add_executable(VorbisCppTest
 	testCRC.cpp
+	testOggStream.cpp
 	../src/util.cpp
+	../src/OggStream.cpp
 )
 target_include_directories(VorbisCppTest PUBLIC ../src)
 target_link_libraries(VorbisCppTest rapidcheck rapidcheck_gtest GTest::gtest GTest::gtest_main)

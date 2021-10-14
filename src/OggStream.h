@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <functional>
 
 namespace vcpp {
     class OggStreamError : public std::runtime_error {
@@ -97,16 +98,18 @@ namespace vcpp {
         struct MetaData {
             const int64_t granulePosition;
             const unsigned int numSkippedPages;
+            const bool isFirstData;
             const bool isContinuedPacket;
             const bool isClosing;
         };
 
-        struct DataCallback {
-            virtual void onDataAvailable(const std::unique_ptr<const uint8_t[]>& data, const std::size_t size, MetaData meta) = 0;
+        class DataCallback {
+        public:
+            virtual void onDataAvailable(const uint8_t* const data, const std::size_t size, MetaData meta) = 0;
         };
 
     private:
-        std::vector<DataCallback*> dataCallbacks_;
+        std::vector<std::shared_ptr<DataCallback>> dataCallbacks_;
         int64_t granulePosition_;
         uint32_t streamSerialNumber_;
         uint32_t pageSequenceNumber_;
@@ -114,15 +117,21 @@ namespace vcpp {
 
     public:
         explicit OggLogicalStreamIn(uint32_t streamSerialNumber);
+        OggLogicalStreamIn(const OggLogicalStreamIn& other) = delete;
+        OggLogicalStreamIn& operator=(const OggLogicalStreamIn& other) = delete;
 
-        void addDataCallback(DataCallback& callback);
-        void removeDataCallback(const DataCallback& callback);
+        OggLogicalStreamIn(OggLogicalStreamIn&& other) = delete;
+        OggLogicalStreamIn& operator=(OggLogicalStreamIn&& other) = delete;
+
+        void addDataCallback(const std::shared_ptr<DataCallback> callback);
+        void removeDataCallback(const std::shared_ptr<DataCallback>& callback);
         void processPage(const OggPage& page);
     };
 
     class OggPhysicalStreamIn {
     public:
-        struct NewStreamCallback {
+        class NewStreamCallback {
+        public:
             virtual void onNewStream(OggLogicalStreamIn& stream) = 0;
         };
 
@@ -159,7 +168,7 @@ namespace vcpp {
         };
 
         const std::unique_ptr<Input> input_;
-        std::vector<NewStreamCallback*> newStreamCallbacks_;
+        std::vector<std::shared_ptr<NewStreamCallback>> newStreamCallbacks_;
         std::unordered_map<uint32_t, OggLogicalStreamIn> logicalStreams_;
 
         OggPage readPage();
@@ -172,8 +181,8 @@ namespace vcpp {
         OggPhysicalStreamIn(const OggPhysicalStreamIn& other) = delete;
         OggPhysicalStreamIn& operator=(const OggPhysicalStreamIn& other) = delete;
 
-        void addNewStreamCallback(NewStreamCallback& callback);
-        void removeNewStreamCallback(const NewStreamCallback& callback);
+        void addNewStreamCallback(const std::shared_ptr<NewStreamCallback> callback);
+        void removeNewStreamCallback(const std::shared_ptr<NewStreamCallback>& callback);
 
         void process();
         
@@ -192,6 +201,11 @@ namespace vcpp {
         OggLogicalStreamOut(OggPhysicalStreamOut& sink, const uint32_t streamSerialNumber);
 
     public:
+        OggLogicalStreamOut(const OggLogicalStreamOut& other) = delete;
+        OggLogicalStreamOut& operator=(const OggLogicalStreamOut& other) = delete;
+
+        OggLogicalStreamOut(OggLogicalStreamOut&& other) noexcept;
+        OggLogicalStreamOut& operator=(OggLogicalStreamOut&& other) = delete;
 
         void writePage(
             const uint8_t* const data,
@@ -213,6 +227,8 @@ namespace vcpp {
     class OggPhysicalStreamOut {
         class Output {
         public:
+            virtual ~Output() = default;
+
             virtual void write(const uint8_t val) = 0;
             virtual void write(const uint8_t* const buffer, std::size_t count) = 0;
         };
@@ -243,7 +259,7 @@ namespace vcpp {
 
     public:
         explicit OggPhysicalStreamOut(FILE* file);
-        explicit OggPhysicalStreamOut(std::basic_ostream<uint8_t> out);
+        explicit OggPhysicalStreamOut(std::basic_ostream<uint8_t>& out);
 
         OggLogicalStreamOut newLogicalStream();
         std::optional<OggLogicalStreamOut> newLogicalStream(const uint32_t streamSerialNumber);

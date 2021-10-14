@@ -52,12 +52,12 @@ OggLogicalStreamIn::OggLogicalStreamIn(uint32_t streamSerialNumber)
       pageSequenceNumber_{ 0 },
       isOpen_{ false } {}
 
-void OggLogicalStreamIn::addDataCallback(DataCallback& callback) {
-    dataCallbacks_.push_back(&callback);
+void OggLogicalStreamIn::addDataCallback(const std::shared_ptr<DataCallback> callback) {
+    dataCallbacks_.emplace_back(callback);
 }
 
-void OggLogicalStreamIn::removeDataCallback(const DataCallback& callback) {
-    auto callbackIt{ find(dataCallbacks_.cbegin(), dataCallbacks_.cend(), &callback) };
+void OggLogicalStreamIn::removeDataCallback(const std::shared_ptr<DataCallback>& callback) {
+    auto callbackIt{ find(dataCallbacks_.cbegin(), dataCallbacks_.cend(), callback) };
     dataCallbacks_.erase(callbackIt);
 }
 
@@ -76,11 +76,12 @@ void OggLogicalStreamIn::processPage(const OggPage& page) {
     const MetaData meta {
         page.granulePosition,
         numSkippedPages,
+        page.isFirstPage,
         page.isContinuedPacket,
         page.isLastPage
     };
-    for (auto it{ dataCallbacks_.begin() }; it != dataCallbacks_.end(); it++) {
-        (*it)->onDataAvailable(page.data, page.dataSize, meta);
+    for (std::shared_ptr<DataCallback>& callback : dataCallbacks_) {
+        callback->onDataAvailable(page.data.get(), page.dataSize, meta);
     }
 
     pageSequenceNumber_ = page.pageSequenceNumber;
@@ -116,7 +117,7 @@ OggPhysicalStreamIn::StreamInput::StreamInput(std::basic_istream<uint8_t>& in) :
 
 uint8_t OggPhysicalStreamIn::StreamInput::read() {
     uint8_t out{ uint8_t(in_.get()) };
-    if (in_.fail()) {
+    if (in_.fail() && !in_.eof()) {
         throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
     }
     return out;
@@ -124,7 +125,7 @@ uint8_t OggPhysicalStreamIn::StreamInput::read() {
 
 std::size_t OggPhysicalStreamIn::StreamInput::read(uint8_t* const buffer, const std::size_t count) {
     in_.read(buffer, count);
-    if (in_.fail()) {
+    if (in_.fail() && !in_.eof()) {
         throw OggStreamError(OggStreamError::Cause::IOError, "IOError occured.");
     }
     return in_.gcount();
@@ -138,12 +139,12 @@ OggPhysicalStreamIn::OggPhysicalStreamIn(std::basic_istream<uint8_t>& in) : inpu
 
 OggPhysicalStreamIn::OggPhysicalStreamIn(FILE* file) : input_{ std::make_unique<FileInput>(file) } {}
 
-void OggPhysicalStreamIn::addNewStreamCallback(NewStreamCallback& callback) {
-    newStreamCallbacks_.push_back(&callback);
+void OggPhysicalStreamIn::addNewStreamCallback(const std::shared_ptr<NewStreamCallback> callback) {
+    newStreamCallbacks_.emplace_back(callback);
 }
 
-void OggPhysicalStreamIn::removeNewStreamCallback(const NewStreamCallback& callback) {
-    auto callbackIt{ find(newStreamCallbacks_.cbegin(), newStreamCallbacks_.cend(), &callback) };
+void OggPhysicalStreamIn::removeNewStreamCallback(const std::shared_ptr<NewStreamCallback>& callback) {
+    auto callbackIt{ find(newStreamCallbacks_.cbegin(), newStreamCallbacks_.cend(), callback) };
     newStreamCallbacks_.erase(callbackIt);
 }
 
@@ -205,7 +206,7 @@ OggPage OggPhysicalStreamIn::readPage() {
         OggStreamError::Cause::UnexpectedEOF
     );
 
-    checksum = oggCRC(&params.data[dataSize - strip], BLOCK_SIZE, checksum);
+    checksum = oggCRC(&params.data[dataSize - strip], strip, checksum);
 #undef BLOCK_SIZE
 
     oggAssert(checksum == params.pageChecksum, "Bad checksum.", OggStreamError::Cause::BadChecksum);
@@ -239,6 +240,14 @@ void OggPhysicalStreamIn::process() {
         if (logicalStreamIt != logicalStreams_.end()) {
             logicalStreamIt->second.processPage(page);
         }
+        else {
+            logicalStreams_.emplace(page.streamSerialNumber, page.streamSerialNumber);
+            OggLogicalStreamIn& newStream{ logicalStreams_.find(page.streamSerialNumber)->second };
+            for (std::shared_ptr<NewStreamCallback>& callback : newStreamCallbacks_) {
+                callback->onNewStream(newStream);
+            }
+            newStream.processPage(page);
+        }
 
         resync();
     }
@@ -255,6 +264,14 @@ OggLogicalStreamOut::OggLogicalStreamOut(OggPhysicalStreamOut& sink, const uint3
     isPacketOpen_{ false },
     isStreamOpen_{ true },
     isFirstWrite_{ true } {}
+
+OggLogicalStreamOut::OggLogicalStreamOut(OggLogicalStreamOut&& other) noexcept
+    : sink_{ other.sink_ },
+      streamSerialNumber_{ std::move(other.streamSerialNumber_) },
+      pageSequenceNumber_{ std::move(other.pageSequenceNumber_) },
+      isPacketOpen_{ std::move(other.isPacketOpen_) },
+      isStreamOpen_{ std::move(other.isStreamOpen_) },
+      isFirstWrite_{ std::move(other.isFirstWrite_) } {}
 
 void OggLogicalStreamOut::writePage(
         const uint8_t* const data,
@@ -284,17 +301,20 @@ void OggLogicalStreamOut::writePage(
     checksum = oggCRC(headerData, 23, checksum);
 
     uint8_t segmentTable[256];
-    for (std::size_t i = 0; i < pageSegments - 1; i++) {
-        segmentTable[i] = 255;
+    if (pageSegments > 0) {
+        for (std::size_t i = 0; i < pageSegments - 1; i++) {
+            segmentTable[i] = 255;
+        }
+
+        const uint8_t lastSegment{ size % 255 };
+        if (lastSegment == 0) {
+            segmentTable[pageSegments - 1] = 255;
+        }
+        else {
+            segmentTable[pageSegments - 1] = lastSegment;
+        }
+        checksum = oggCRC(segmentTable, pageSegments, checksum);
     }
-    const uint8_t lastSegment{ size % 255 };
-    if (lastSegment == 0) {
-        segmentTable[pageSegments - 1] = 255;
-    }
-    else {
-        segmentTable[pageSegments - 1] = lastSegment;
-    }
-    checksum = oggCRC(segmentTable, pageSegments, checksum);
 
     checksum = oggCRC(data, size, checksum);
 
@@ -351,6 +371,12 @@ void OggPhysicalStreamOut::StreamOutput::write(const uint8_t val) {
 void OggPhysicalStreamOut::StreamOutput::write(const uint8_t* buffer, const std::size_t count) {
     out_.write(buffer, count);
 }
+
+OggPhysicalStreamOut::OggPhysicalStreamOut(FILE* file) 
+    : output_ { std::make_unique<FileOutput>(file) } {}
+
+OggPhysicalStreamOut::OggPhysicalStreamOut(std::basic_ostream<uint8_t>& out) 
+    : output_{ std::make_unique<StreamOutput>(out) } {}
 
 static uint32_t lfsrNext(const uint32_t lfsr) {
     unsigned int bit{ (lfsr ^ (lfsr >> 1) ^ (lfsr >> 21) ^ (lfsr >> 31)) & 1 };
