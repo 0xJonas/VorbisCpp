@@ -58,7 +58,9 @@ void OggLogicalStreamIn::addDataCallback(const std::shared_ptr<DataCallback> cal
 
 void OggLogicalStreamIn::removeDataCallback(const std::shared_ptr<DataCallback>& callback) {
     auto callbackIt{ find(dataCallbacks_.cbegin(), dataCallbacks_.cend(), callback) };
-    dataCallbacks_.erase(callbackIt);
+    if (callbackIt != dataCallbacks_.cend()) {
+        dataCallbacks_.erase(callbackIt);
+    }
 }
 
 void OggLogicalStreamIn::processPage(const OggPage& page) {
@@ -241,7 +243,7 @@ void OggPhysicalStreamIn::process() {
             logicalStreamIt->second.processPage(page);
         }
         else {
-            logicalStreams_.emplace(page.streamSerialNumber, page.streamSerialNumber);
+            logicalStreams_.emplace(page.streamSerialNumber, OggLogicalStreamIn(page.streamSerialNumber));
             OggLogicalStreamIn& newStream{ logicalStreams_.find(page.streamSerialNumber)->second };
             for (std::shared_ptr<NewStreamCallback>& callback : newStreamCallbacks_) {
                 callback->onNewStream(newStream);

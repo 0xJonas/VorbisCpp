@@ -18,7 +18,7 @@ public:
 
     TestDataCallback() : numPackets{ 0 }, bytesRead{ 0 }, isFirstPage{ true }, isClosed{ false } {}
 
-    void onDataAvailable(const uint8_t* const data, const std::size_t size, OggLogicalStreamIn::MetaData meta) {
+    void onDataAvailable(const uint8_t* const data, const std::size_t size, const OggLogicalStreamIn::MetaData meta) {
         RC_ASSERT(meta.numSkippedPages == 0);
         RC_ASSERT(isFirstPage == meta.isFirstData);
         RC_ASSERT_FALSE(isClosed);
